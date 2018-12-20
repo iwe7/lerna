@@ -7,17 +7,45 @@ const runScript = require("libnpm/run-script");
 const npmConf = require("@lerna/npm-conf");
 const runLifecycle = require("../run-lifecycle");
 
-describe("default export", () => {
+describe("runLifecycle()", () => {
+  it("skips packages without scripts", async () => {
+    const pkg = {
+      name: "no-scripts",
+    };
+
+    const result = await runLifecycle(pkg, "foo", new Map());
+
+    expect(result).toBe(pkg);
+    expect(runScript).not.toHaveBeenCalled();
+  });
+
+  it("skips packages without matching script", async () => {
+    const pkg = {
+      name: "missing-script",
+      scripts: {
+        test: "foo",
+      },
+    };
+
+    const result = await runLifecycle(pkg, "bar", new Map());
+
+    expect(result).toBe(pkg);
+    expect(runScript).not.toHaveBeenCalled();
+  });
+
   it("calls npm-lifecycle with prepared arguments", async () => {
     const pkg = {
       name: "test-name",
       version: "1.0.0-test",
       location: "test-location",
+      scripts: {
+        preversion: "test",
+      },
     };
     const stage = "preversion";
-    const config = npmConf({ "custom-cli-flag": true });
+    const opts = npmConf({ "custom-cli-flag": true });
 
-    const result = await runLifecycle(pkg, stage, config);
+    const result = await runLifecycle(pkg, stage, opts);
 
     expect(result).toBe(pkg);
     expect(runScript).toHaveBeenLastCalledWith(
@@ -40,6 +68,64 @@ describe("default export", () => {
         unsafePerm: true,
       })
     );
+  });
+
+  it("camelCases dashed-options", async () => {
+    const pkg = {
+      name: "dashed-name",
+      version: "1.0.0-dashed",
+      location: "dashed-location",
+      scripts: {
+        prepublish: "test",
+      },
+    };
+    const dir = pkg.location;
+    const stage = "prepublish";
+    const opts = new Map([
+      ["ignore-prepublish", true],
+      ["ignore-scripts", true],
+      ["node-options", true],
+      ["script-shell", true],
+      ["scripts-prepend-node-path", true],
+      ["unsafe-perm", true],
+    ]);
+
+    await runLifecycle(pkg, stage, opts);
+
+    expect(runScript).toHaveBeenLastCalledWith(expect.objectContaining(pkg), stage, dir, {
+      config: expect.objectContaining({
+        prefix: dir,
+      }),
+      dir,
+      failOk: false,
+      log: expect.any(Object),
+      ignorePrepublish: true,
+      ignoreScripts: true,
+      nodeOptions: true,
+      scriptShell: true,
+      scriptsPrependNodePath: true,
+      unsafePerm: true,
+    });
+  });
+
+  it("omits circular opts", async () => {
+    const pkg = {
+      name: "circular-name",
+      version: "1.0.0-circular",
+      location: "circular-location",
+      scripts: {
+        prepack: "test",
+      },
+    };
+    const stage = "prepack";
+    const opts = new Map();
+
+    await runLifecycle(pkg, stage, opts);
+
+    const callOpts = runScript.mock.calls.pop().pop();
+
+    expect(callOpts).not.toHaveProperty("config.log");
+    expect(callOpts).not.toHaveProperty("config.logstream");
   });
 });
 

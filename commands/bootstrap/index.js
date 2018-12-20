@@ -12,9 +12,8 @@ const pWaterfall = require("p-waterfall");
 const Command = require("@lerna/command");
 const rimrafDir = require("@lerna/rimraf-dir");
 const hasNpmVersion = require("@lerna/has-npm-version");
-const npmConf = require("@lerna/npm-conf");
 const npmInstall = require("@lerna/npm-install");
-const runLifecycle = require("@lerna/run-lifecycle");
+const { createRunner } = require("@lerna/run-lifecycle");
 const batchPackages = require("@lerna/batch-packages");
 const runParallelBatches = require("@lerna/run-parallel-batches");
 const symlinkBinary = require("@lerna/symlink-binary");
@@ -22,6 +21,8 @@ const symlinkDependencies = require("@lerna/symlink-dependencies");
 const ValidationError = require("@lerna/validation-error");
 const { getFilteredPackages } = require("@lerna/filter-options");
 const PackageGraph = require("@lerna/package-graph");
+const pulseTillDone = require("@lerna/pulse-till-done");
+
 const hasDependencyInstalled = require("./lib/has-dependency-installed");
 const isHoistedPackage = require("./lib/is-hoisted-package");
 
@@ -63,7 +64,7 @@ class BootstrapCommand extends Command {
       );
     }
 
-    this.conf = npmConf({ registry });
+    this.runPackageLifecycle = createRunner({ registry });
     this.npmConfig = {
       registry,
       npmClient,
@@ -176,24 +177,15 @@ class BootstrapCommand extends Command {
       return;
     }
 
-    const packagesWithScript = new Set(this.filteredPackages.filter(pkg => pkg.scripts[stage]));
-
-    if (!packagesWithScript.size) {
-      return;
-    }
-
     const tracker = this.logger.newItem(stage);
 
-    const mapPackageWithScript = pkg => {
-      if (packagesWithScript.has(pkg)) {
-        return runLifecycle(pkg, stage, this.conf).then(() => {
-          tracker.silly("lifecycle", "finished", pkg.name);
-          tracker.completeWork(1);
-        });
-      }
-    };
+    const mapPackageWithScript = pkg =>
+      this.runPackageLifecycle(pkg, stage).then(() => {
+        tracker.silly("lifecycle", "finished %j in %s", stage, pkg.name);
+        tracker.completeWork(1);
+      });
 
-    tracker.addWork(packagesWithScript.size);
+    tracker.addWork(this.filteredPackages.length);
 
     return pFinally(runParallelBatches(this.batchedPackages, this.concurrency, mapPackageWithScript), () =>
       tracker.finish()
@@ -449,8 +441,9 @@ class BootstrapCommand extends Command {
           tracker.info("hoist", "Installing hoisted dependencies into root");
         }
 
-        return npmInstall
-          .dependencies(rootPkg, depsToInstallInRoot, this.npmConfig)
+        const promise = npmInstall.dependencies(rootPkg, depsToInstallInRoot, this.npmConfig);
+
+        return pulseTillDone(promise)
           .then(() =>
             // Link binaries into dependent packages so npm scripts will
             // have access to them.
@@ -500,7 +493,7 @@ class BootstrapCommand extends Command {
         return pMap(
           candidates,
           dirPath =>
-            rimrafDir(dirPath).then(() => {
+            pulseTillDone(rimrafDir(dirPath)).then(() => {
               tracker.verbose("prune", dirPath);
               tracker.completeWork(1);
             }),
@@ -527,8 +520,9 @@ class BootstrapCommand extends Command {
       if (deps.some(({ isSatisfied }) => !isSatisfied)) {
         actions.push(() => {
           const dependencies = deps.map(({ dependency }) => dependency);
+          const promise = npmInstall.dependencies(leafNode.pkg, dependencies, leafNpmConfig);
 
-          return npmInstall.dependencies(leafNode.pkg, dependencies, leafNpmConfig).then(() => {
+          return pulseTillDone(promise).then(() => {
             tracker.verbose("installed leaf", leafNode.name);
             tracker.completeWork(1);
           });

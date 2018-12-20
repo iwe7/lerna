@@ -32,6 +32,8 @@ const initFixture = require("@lerna-test/init-fixture")(__dirname);
 // file under test
 const lernaPublish = require("@lerna-test/command-runner")(require("../command"));
 
+expect.extend(require("@lerna-test/figgy-pudding-matchers"));
+
 describe("PublishCommand", () => {
   describe("cli validation", () => {
     let cwd;
@@ -113,18 +115,15 @@ Set {
       expect(npmDistTag.add).not.toHaveBeenCalled();
 
       expect(getNpmUsername).toHaveBeenCalled();
-      expect(getNpmUsername.registry.get(testDir).get("registry")).toBe("https://registry.npmjs.org/");
+      expect(getNpmUsername).toHaveBeenLastCalledWith(
+        expect.figgyPudding({ registry: "https://registry.npmjs.org/" })
+      );
 
       expect(verifyNpmPackageAccess).toHaveBeenCalled();
-      expect(verifyNpmPackageAccess.registry.get(testDir)).toMatchInlineSnapshot(`
-Set {
-  "package-1",
-  "package-2",
-  "package-3",
-  "package-4",
-  "username: lerna-test",
-}
-`);
+      expect(verifyNpmPackageAccess).toHaveBeenLastCalledWith(
+        expect.any(Array),
+        expect.figgyPudding({ registry: "https://registry.npmjs.org/" })
+      );
     });
 
     it("publishes changed independent packages", async () => {
@@ -322,7 +321,8 @@ Set {
 
       expect(npmPublish).toHaveBeenCalledWith(
         expect.objectContaining({ name: "package-1" }),
-        undefined, // dist-tag
+        "latest", // dist-tag
+        "/TEMP_DIR/package-1-MOCKED.tgz",
         expect.objectContaining({ registry })
       );
     });
@@ -335,7 +335,8 @@ Set {
 
       expect(npmPublish).toHaveBeenCalledWith(
         expect.objectContaining({ name: "package-1" }),
-        undefined, // dist-tag
+        "latest", // dist-tag
+        "/TEMP_DIR/package-1-MOCKED.tgz",
         expect.objectContaining({ registry: "https://registry.npmjs.org/" })
       );
 

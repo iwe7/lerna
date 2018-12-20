@@ -2,6 +2,7 @@
 
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const pFinally = require("p-finally");
 const pMap = require("p-map");
 const pPipe = require("p-pipe");
@@ -23,6 +24,7 @@ const logPacked = require("@lerna/log-packed");
 const { createRunner } = require("@lerna/run-lifecycle");
 const batchPackages = require("@lerna/batch-packages");
 const runParallelBatches = require("@lerna/run-parallel-batches");
+const pulseTillDone = require("@lerna/pulse-till-done");
 const versionCommand = require("@lerna/version");
 
 const createTempLicenses = require("./lib/create-temp-licenses");
@@ -70,11 +72,23 @@ class PublishCommand extends Command {
     // https://docs.npmjs.com/misc/config#save-prefix
     this.savePrefix = this.options.exact ? "" : "^";
 
+    // npmSession and user-agent are consumed by libnpm/fetch (via libnpm/publish)
+    const npmSession = crypto.randomBytes(8).toString("hex");
+    const userAgent = `lerna/${this.options.lernaVersion}/node@${process.version}+${process.arch} (${
+      process.platform
+    })`;
+
+    this.logger.verbose("session", npmSession);
+    this.logger.verbose("user-agent", userAgent);
+
     this.conf = npmConf({
-      command: "publish",
-      log: this.logger,
+      lernaCommand: "publish",
+      npmSession,
+      npmVersion: userAgent,
       registry: this.options.registry,
     });
+
+    this.conf.set("user-agent", userAgent, "cli");
 
     if (this.conf.get("registry") === "https://registry.yarnpkg.com") {
       this.logger.warn("", "Yarn's registry proxy is broken, replacing with public npm registry");
@@ -83,24 +97,26 @@ class PublishCommand extends Command {
       this.conf.set("registry", "https://registry.npmjs.org/", "cli");
     }
 
+    // inject --npm-tag into opts, if present
+    const distTag = this.getDistTag();
+
+    if (distTag) {
+      this.conf.set("tag", distTag.trim(), "cli");
+    }
+
     // all consumers need a token
     const registry = this.conf.get("registry");
-    const auth = getAuth(registry, this.conf);
+    const auth = getAuth(registry, this.conf.snapshot);
 
     if (auth.token) {
       this.conf.set("token", auth.token, "cli");
     }
 
-    this.npmConfig = {
-      npmClient: this.options.npmClient || "npm",
-      registry: this.conf.get("registry"),
-    };
-
     let chain = Promise.resolve();
 
     // validate user has valid npm credentials first,
     // by far the most common form of failed execution
-    chain = chain.then(() => getNpmUsername(this.conf));
+    chain = chain.then(() => getNpmUsername(this.conf.snapshot));
     chain = chain.then(username => {
       // username is necessary for subsequent access check
       this.conf.add({ username }, "cmd");
@@ -245,7 +261,7 @@ class PublishCommand extends Command {
     // attempting to publish a release with local changes is not allowed
     chain = chain.then(() => this.verifyWorkingTreeClean());
 
-    chain = chain.then(() => getUnpublishedPackages(this.project, this.conf));
+    chain = chain.then(() => getUnpublishedPackages(this.project, this.conf.snapshot));
     chain = chain.then(unpublishedPackages => {
       if (!unpublishedPackages.length) {
         this.logger.notice("from-package", "No unpublished release found");
@@ -386,7 +402,7 @@ class PublishCommand extends Command {
 
     // if no username was retrieved, don't bother validating
     if (this.conf.get("username") && this.verifyAccess) {
-      chain = chain.then(() => verifyNpmPackageAccess(this.packagesToPublish, this.conf));
+      chain = chain.then(() => verifyNpmPackageAccess(this.packagesToPublish, this.conf.snapshot));
     }
 
     return chain;
@@ -487,7 +503,7 @@ class PublishCommand extends Command {
   packUpdated() {
     const tracker = this.logger.newItem("npm pack");
 
-    tracker.addWork(this.packagesToPublish.length);
+    tracker.addWork(this.packagesToPublish.length + 1);
 
     let chain = Promise.resolve();
 
@@ -497,30 +513,26 @@ class PublishCommand extends Command {
     chain = chain.then(() => this.runPackageLifecycle(this.project.manifest, "prepublishOnly"));
     chain = chain.then(() => this.runPackageLifecycle(this.project.manifest, "prepack"));
 
+    const opts = this.conf.snapshot;
     const mapper = pPipe(
       [
         this.options.requireScripts && (pkg => this.execScript(pkg, "prepublish")),
 
         pkg =>
-          packDirectory(pkg, this.conf).then(packed => {
-            pkg.tarball = packed;
+          pulseTillDone(packDirectory(pkg, opts)).then(packed => {
+            tracker.completeWork(1);
 
-            logPacked(packed);
+            // store metadata for use in this.publishPacked()
+            pkg.packed = packed;
 
-            return pkg;
+            // manifest may be mutated by any previous lifecycle
+            return pkg.refresh();
           }),
-
-        // manifest may be mutated by any previous lifecycle
-        pkg => pkg.refresh(),
       ].filter(Boolean)
     );
 
     chain = chain.then(() =>
-      pReduce(this.batchedPackages, (_, batch) =>
-        pMap(batch, mapper, { concurrency: 10 }).then(() => {
-          tracker.completeWork(batch.length);
-        })
-      )
+      pReduce(this.batchedPackages, (_, batch) => pMap(batch, mapper, { concurrency: 10 }))
     );
 
     chain = chain.then(() => removeTempLicenses(this.packagesToBeLicensed));
@@ -535,28 +547,27 @@ class PublishCommand extends Command {
 
   publishPacked() {
     // if we skip temp tags we should tag with the proper value immediately
-    const distTag = this.options.tempTag ? "lerna-temp" : this.getDistTag();
-    const tracker = this.logger.newItem(`${this.npmConfig.npmClient} publish`);
+    const distTag = this.options.tempTag ? "lerna-temp" : this.conf.get("tag");
+    const tracker = this.logger.newItem("publish");
 
     tracker.addWork(this.packagesToPublish.length);
 
     let chain = Promise.resolve();
 
+    const opts = this.conf.snapshot;
     const mapper = pPipe(
       [
-        pkg => npmPublish(pkg, distTag, this.npmConfig),
+        pkg =>
+          pulseTillDone(npmPublish(pkg, distTag, pkg.packed.tarFilePath, opts)).then(() => {
+            tracker.completeWork(1);
+            tracker.success("published", pkg.name, pkg.version);
 
-        // postpublish is _not_ run when publishing a tarball
-        pkg => this.runPackageLifecycle(pkg, "postpublish"),
+            logPacked(pkg.packed);
+
+            return pkg;
+          }),
 
         this.options.requireScripts && (pkg => this.execScript(pkg, "postpublish")),
-
-        pkg => {
-          tracker.info("published", pkg.name, pkg.version);
-          tracker.completeWork(1);
-
-          return pkg;
-        },
       ].filter(Boolean)
     );
 
@@ -568,30 +579,27 @@ class PublishCommand extends Command {
   }
 
   npmUpdateAsLatest() {
-    const distTag = this.getDistTag() || "latest";
+    const distTag = this.conf.get("tag");
     const tracker = this.logger.newItem("npmUpdateAsLatest");
 
     tracker.addWork(this.packagesToPublish.length);
 
     let chain = Promise.resolve();
 
-    const mapper = pPipe([
-      pkg => {
-        const spec = `${pkg.name}@${pkg.version}`;
+    const opts = this.conf.snapshot;
+    const mapper = pkg => {
+      const spec = `${pkg.name}@${pkg.version}`;
 
-        return Promise.resolve()
-          .then(() => npmDistTag.remove(spec, "lerna-temp", this.conf))
-          .then(() => npmDistTag.add(spec, distTag, this.conf))
-          .then(() => pkg);
-      },
+      return Promise.resolve()
+        .then(() => pulseTillDone(npmDistTag.remove(spec, "lerna-temp", opts)))
+        .then(() => pulseTillDone(npmDistTag.add(spec, distTag, opts)))
+        .then(() => {
+          tracker.info("dist-tag", "%s@%s => %j", pkg.name, pkg.version, distTag);
+          tracker.completeWork(1);
 
-      pkg => {
-        tracker.info("dist-tag", "%s@%s => %j", pkg.name, pkg.version, distTag);
-        tracker.completeWork(1);
-
-        return pkg;
-      },
-    ]);
+          return pkg;
+        });
+    };
 
     chain = chain.then(() => runParallelBatches(this.batchedPackages, this.concurrency, mapper));
 

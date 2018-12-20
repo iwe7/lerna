@@ -1,8 +1,8 @@
 "use strict";
 
-const fs = require("fs-extra");
-const path = require("path");
+const figgyPudding = require("figgy-pudding");
 const packlist = require("npm-packlist");
+const log = require("libnpm/log");
 const tar = require("tar");
 const tempWrite = require("temp-write");
 const getPacked = require("@lerna/get-packed");
@@ -10,7 +10,16 @@ const runLifecycle = require("@lerna/run-lifecycle");
 
 module.exports = packDirectory;
 
-function packDirectory(pkg, opts) {
+const PackConfig = figgyPudding({
+  log: { default: log },
+  "lerna-command": { default: "pack" },
+  lernaCommand: "lerna-command",
+  "ignore-prepublish": {},
+  ignorePrepublish: "ignore-prepublish",
+});
+
+function packDirectory(pkg, _opts) {
+  const opts = PackConfig(_opts);
   const dir = pkg.location;
   const name =
     pkg.name[0] === "@"
@@ -19,15 +28,17 @@ function packDirectory(pkg, opts) {
       : pkg.name;
   const outputFileName = `${name}-${pkg.version}.tgz`;
 
+  opts.log.verbose("packDirectory", dir);
+
   let chain = Promise.resolve();
 
-  if (opts.get("ignore-prepublish") !== false) {
+  if (opts.ignorePrepublish !== false) {
     chain = chain.then(() => runLifecycle(pkg, "prepublish", opts));
   }
 
   chain = chain.then(() => runLifecycle(pkg, "prepare", opts));
 
-  if (opts.get("command") === "publish") {
+  if (opts.lernaCommand === "publish") {
     chain = chain.then(() => pkg.refresh());
     chain = chain.then(() => runLifecycle(pkg, "prepublishOnly", opts));
     chain = chain.then(() => pkg.refresh());
@@ -57,7 +68,6 @@ function packDirectory(pkg, opts) {
   chain = chain.then(tarFilePath =>
     getPacked(pkg, tarFilePath).then(packed =>
       Promise.resolve()
-        .then(() => fs.move(tarFilePath, path.join(dir, outputFileName), { overwrite: true }))
         .then(() => runLifecycle(pkg, "postpack", opts))
         .then(() => packed)
     )
